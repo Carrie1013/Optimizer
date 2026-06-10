@@ -83,31 +83,18 @@ const MathUtils = {
   // ── Covariance matrix from returns data ────────────────
   // returns: array of arrays — returns[ticker][t] = monthly return at time t
   computeCovFromReturns(returnsList) {
-    const n = returnsList.length;
-    const T = Math.min(...returnsList.map(r => r.length));
-    if (T < 6) return null;
-
-    const trimmed = returnsList.map(r => r.slice(-T));
-    const means   = trimmed.map(r => r.reduce((a, b) => a + b, 0) / T);
-
-    const cov = Array.from({ length: n }, () => new Array(n).fill(0));
-    for (let i = 0; i < n; i++)
-      for (let j = 0; j < n; j++) {
-        let sum = 0;
-        for (let t = 0; t < T; t++)
-          sum += (trimmed[i][t] - means[i]) * (trimmed[j][t] - means[j]);
-        cov[i][j] = (sum / (T - 1)) * 12; // annualize
-    }
-    return { cov, means: means.map(m => m * 12), T }; // annualized
+    const sample = this.computeReturnMoments(returnsList, { annualize: true });
+    if (!sample) return null;
+    return { cov: sample.cov, means: sample.means, T: sample.T };
   },
 
   // Ledoit-Wolf style shrinkage toward scaled identity.
   // Input returns are expected in monthly decimal form and aligned by time.
   estimateShrunkMoments(returnsList, expenseRatios = null) {
-    const sample = this.computeCovFromReturns(returnsList);
+    const sample = this.computeReturnMoments(returnsList, { annualize: true });
     if (!sample) return null;
 
-    const { cov: sampleCov, means, T } = sample;
+    const { cov: sampleCov, means, rawMeans, T } = sample;
     const n = sampleCov.length;
     const avgVar = sampleCov.reduce((sum, row, i) => sum + row[i], 0) / n;
     const target = Array.from({ length: n }, (_, i) =>
@@ -127,7 +114,7 @@ const MathUtils = {
       const rt = returnsList.map(series => series[series.length - T + t]);
       for (let i = 0; i < n; i++) {
         for (let j = 0; j < n; j++) {
-          const outer = (rt[i] - means[i] / 12) * (rt[j] - means[j] / 12) * 12;
+          const outer = (rt[i] - rawMeans[i]) * (rt[j] - rawMeans[j]) * 12;
           const diff = outer - sampleCov[i][j];
           beta2 += diff * diff;
         }
@@ -146,6 +133,8 @@ const MathUtils = {
     return {
       cov: this.stabilizeCov(cov, 1e-8),
       means: adjustedMeans,
+      monthlyMeans: rawMeans,
+      monthlyCov: sampleCov.map(row => row.map(v => v / 12)),
       sampleCov,
       alpha,
       T,
@@ -368,7 +357,6 @@ const MathUtils = {
     const samples = [];
 
     for (let t = 0; t < T; t++) {
-      // Box-Muller for standard normal
       const z = Array.from({ length: n }, () => {
         let u = 0;
         for (let k = 0; k < 12; k++) u += Math.random();
@@ -381,25 +369,14 @@ const MathUtils = {
       samples.push(r);
     }
 
-    const sampleMu = new Array(n).fill(0);
-    samples.forEach(r => r.forEach((v, i) => (sampleMu[i] += v / T)));
-
-    const sampleCov = Array.from({ length: n }, () => new Array(n).fill(0));
-    samples.forEach(r => {
-      const dev = r.map((v, i) => v - sampleMu[i]);
-      for (let i = 0; i < n; i++)
-        for (let j = 0; j < n; j++)
-          sampleCov[i][j] += (dev[i] * dev[j]) / (T - 1);
-    });
-
-    return { sampleMu, sampleCov };
+    return samples;
   },
 
   // ── Michaud Resampled Efficient Frontier ───────────────
   // nSims: number of Monte-Carlo simulations
   // nPoints: number of frontier points
   // onProgress(pct): optional callback for progress updates
-  async generateREF(mu, cov, { lb = 0, ub = 1.0, nSims = 100, nPoints = 25, simNPoints = 16, rfRate = 0.0525, onProgress, sampleLength = 120 } = {}) {
+  async generateREF(mu, cov, { lb = 0, ub = 1.0, nSims = 100, nPoints = 25, simNPoints = 16, rfRate = 0.0525, onProgress, sampleLength = 120, returnsList = null, bootstrapMethod = 'parametric' } = {}) {
     const n = mu.length;
     const allWeightsByRank = Array.from({ length: nPoints }, () => Array.from({ length: n }, () => []));
     const simulatedFrontiers = [];
@@ -411,7 +388,12 @@ const MathUtils = {
 
       for (let s = start; s < Math.min(start + chunkSize, nSims); s++) {
         try {
-          const { sampleMu, sampleCov } = this.sampleMVN(mu, cov, sampleLength);
+          const boot = returnsList
+            ? this.bootstrapMoments(returnsList, { method: bootstrapMethod, shrink: false })
+            : null;
+          const sampleMu = boot?.sampleMu || null;
+          const sampleCov = boot?.sampleCov || null;
+          if (!sampleMu || !sampleCov) continue;
           const frontier = this.generateEfficientFrontier(sampleMu, sampleCov, { lb, ub, nPoints: simNPoints, rfRate });
           if (frontier.length < 2) continue;
 
@@ -482,4 +464,63 @@ const MathUtils = {
       return { x: vol, y: rfRet + slope * vol };
     });
   },
+};
+
+
+MathUtils.computeReturnMoments = function(returnsList, { annualize = true } = {}) {
+  const n = returnsList.length;
+  const T = Math.min(...returnsList.map(r => r.length));
+  if (T < 6) return null;
+
+  const trimmed = returnsList.map(r => r.slice(-T));
+  const means = trimmed.map(r => r.reduce((a, b) => a + b, 0) / T);
+  const scale = annualize ? 12 : 1;
+
+  const cov = Array.from({ length: n }, () => new Array(n).fill(0));
+  for (let i = 0; i < n; i++)
+    for (let j = 0; j < n; j++) {
+      let sum = 0;
+      for (let t = 0; t < T; t++)
+        sum += (trimmed[i][t] - means[i]) * (trimmed[j][t] - means[j]);
+      cov[i][j] = (sum / (T - 1)) * scale;
+    }
+
+  return {
+    cov,
+    means: means.map(m => m * scale),
+    rawMeans: means,
+    trimmed,
+    T,
+  };
+};
+
+MathUtils.bootstrapMoments = function(returnsList, { method = 'parametric', shrink = false } = {}) {
+  const sample = this.computeReturnMoments(returnsList, { annualize: false });
+  if (!sample) return null;
+
+  const { rawMeans, cov: monthlySampleCov, T } = sample;
+  if (method !== 'parametric') return null;
+
+  const syntheticRows = this.sampleMVN(rawMeans, monthlySampleCov, T);
+  const bootReturnsList = rawMeans.map((_, i) => syntheticRows.map(row => row[i]));
+
+  if (shrink) {
+    const shrunk = this.estimateShrunkMoments(bootReturnsList, new Array(rawMeans.length).fill(0));
+    if (!shrunk) return null;
+    return {
+      sampleMu: shrunk.means,
+      sampleCov: shrunk.cov,
+      bootReturnsList,
+      T: shrunk.T,
+    };
+  }
+
+  const bootMoments = this.computeReturnMoments(bootReturnsList, { annualize: true });
+  if (!bootMoments) return null;
+  return {
+    sampleMu: bootMoments.means,
+    sampleCov: this.stabilizeCov(bootMoments.cov, 1e-8),
+    bootReturnsList,
+    T: bootMoments.T,
+  };
 };

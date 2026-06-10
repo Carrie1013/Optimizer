@@ -273,6 +273,7 @@ const OptimizerView = {
         source: 'fallback',
         windowMonths: 0,
         shrinkageAlpha: null,
+        returnsList: null,
       };
     }
 
@@ -287,6 +288,7 @@ const OptimizerView = {
         source: 'fallback',
         windowMonths: 0,
         shrinkageAlpha: null,
+        returnsList: null,
       };
     }
 
@@ -303,6 +305,7 @@ const OptimizerView = {
       source: 'rolling-shrunk',
       windowMonths: estimated.T,
       shrinkageAlpha: estimated.alpha,
+      returnsList: aligned.returnsList,
     };
   },
 
@@ -352,6 +355,7 @@ const OptimizerView = {
       estimationSource: modelInputs.source,
       windowMonths: modelInputs.windowMonths,
       shrinkageAlpha: modelInputs.shrinkageAlpha,
+      returnsList: modelInputs.returnsList,
     };
     this._refResults = null;
     this._selectedPoint = maxSharpe;
@@ -374,13 +378,15 @@ const OptimizerView = {
     btn.innerHTML = '<span class="spinner-sm"></span> Resampling...';
 
     const nSims = parseInt(document.getElementById('simSlider').value);
-    const { mu, cov, rf, assets } = this._results;
+    const { mu, cov, rf, assets, returnsList } = this._results;
     const ub = parseInt(document.getElementById('ubSlider').value) / 100;
 
     document.getElementById('progressWrap').style.display = 'block';
 
     this._refResults = await MathUtils.generateREF(mu, cov, {
       lb: 0, ub, nSims, nPoints: 25, simNPoints: 16, rfRate: rf,
+      returnsList,
+      bootstrapMethod: 'parametric',
       onProgress: pct => {
         document.getElementById('progressBar').style.width = pct + '%';
         document.getElementById('progressPct').textContent = pct + '%';
@@ -433,7 +439,7 @@ const OptimizerView = {
 
         ${this._refResults ? `
           <div class="info-box mt-12">
-            <strong>&#9679; Michaud REF displayed:</strong> ${this._refResults.simulatedFrontiers.length} simulated frontiers are overlaid.
+            <strong>&#9679; Bootstrap REF displayed:</strong> ${this._refResults.simulatedFrontiers.length} bootstrap frontiers are overlaid.
             The thick dashed curve is the resampled frontier produced by averaging portfolio weights by risk rank across simulations.
             This usually trades a bit of in-sample optimality for more robust, estimation-error-resistant allocations.
           </div>` : ''}
